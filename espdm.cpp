@@ -1,5 +1,4 @@
 #include "espdm.h"
-#include "espdm_mbus.h"
 #include "espdm_dlms.h"
 #include "espdm_obis.h"
 
@@ -20,180 +19,167 @@ namespace esphome
 
             while(available()) // Read while data is available
             {
-                uint8_t c;
-                this->read_byte(&c);
-                this->receiveBuffer.push_back(c);
+                if(receiveBufferIndex >= receiveBufferSize)
+                {
+                    ESP_LOGE(TAG, "Buffer overflow");
+                    receiveBufferIndex = 0;
+                }
 
-                this->lastRead = currentTime;
+                receiveBuffer[receiveBufferIndex] = read();
+                receiveBufferIndex++;
+
+                lastRead = currentTime;
             }
 
-            if(!this->receiveBuffer.empty() && currentTime - this->lastRead > this->readTimeout)
+            if(receiveBufferIndex > 0 && currentTime - lastRead > readTimeout)
             {
-                log_packet(this->receiveBuffer);
-
-                // Verify and parse M-Bus frames
-
-                ESP_LOGV(TAG, "Parsing M-Bus frames");
-
-                uint16_t frameOffset = 0; // Offset is used if the M-Bus message is split into multiple frames
-                std::vector<uint8_t> mbusPayload; // Contains the data of the payload
-
-                while(true)
+                if(receiveBufferIndex < 256)
                 {
-                    ESP_LOGV(TAG, "MBUS: Parsing frame");
-
-                    // Check start bytes
-                    if(this->receiveBuffer[frameOffset + MBUS_START1_OFFSET] != 0x68 || this->receiveBuffer[frameOffset + MBUS_START2_OFFSET] != 0x68)
-                    {
-                        ESP_LOGE(TAG, "MBUS: Start bytes do not match");
-                        return abort();
-                    }
-
-                    // Both length bytes must be identical
-                    if(this->receiveBuffer[frameOffset + MBUS_LENGTH1_OFFSET] != this->receiveBuffer[frameOffset + MBUS_LENGTH2_OFFSET])
-                    {
-                        ESP_LOGE(TAG, "MBUS: Length bytes do not match");
-                        return abort();
-                    }
-
-                    uint8_t frameLength = this->receiveBuffer[frameOffset + MBUS_LENGTH1_OFFSET]; // Get length of this frame
-
-                    // Check if received data is enough for the given frame length
-                    if(this->receiveBuffer.size() - frameOffset < frameLength + 3)
-                    {
-                        ESP_LOGE(TAG, "MBUS: Frame too big for received data");
-                        return abort();
-                    }
-
-                    if(this->receiveBuffer[frameOffset + frameLength + MBUS_HEADER_INTRO_LENGTH + MBUS_FOOTER_LENGTH - 1] != 0x16)
-                    {
-                        ESP_LOGE(TAG, "MBUS: Invalid stop byte");
-                        return abort();
-                    }
-
-                    mbusPayload.insert(mbusPayload.end(), &this->receiveBuffer[frameOffset + MBUS_FULL_HEADER_LENGTH], &this->receiveBuffer[frameOffset + MBUS_HEADER_INTRO_LENGTH + frameLength]);
-
-                    frameOffset += MBUS_HEADER_INTRO_LENGTH + frameLength + MBUS_FOOTER_LENGTH;
-
-                    if(frameOffset >= this->receiveBuffer.size()) // No more data to read, exit loop
-                    {
-                        break;
-                    }
-                }
-
-                // Verify and parse DLMS header
-
-                ESP_LOGV(TAG, "Parsing DLMS header");
-
-                if(mbusPayload.size() < 20) // If the payload is too short we need to abort
-                {
-                    ESP_LOGE(TAG, "DLMS: Payload too short");
+                    ESP_LOGE(TAG, "Received packet with invalid size");
                     return abort();
                 }
 
-                if(mbusPayload[DLMS_CIPHER_OFFSET] != 0xDB) // Only general-glo-ciphering is supported (0xDB)
+                ESP_LOGD(TAG, "Handling packet");
+                log_packet(receiveBuffer, receiveBufferIndex);
+
+                // Decrypting
+
+                uint16_t payloadLength;
+                // memcpy(&payloadLength, &receiveBuffer[20], 2); // Copy payload length
+                // payloadLength = swap_uint16(payloadLength) - 5;
+                payloadLength = 243;
+
+                // if(receiveBufferIndex <= payloadLength)
+                // {
+                //     ESP_LOGE(TAG, "Payload length is too big for received data");
+                //     return abort();
+                // }
+                
+
+                uint16_t telegramLength;
+                telegramLength = 282;
+                if(receiveBufferIndex < telegramLength)
                 {
-                    ESP_LOGE(TAG, "DLMS: Unsupported cipher");
+                    ESP_LOGI(TAG," %u", receiveBufferIndex);
+                    ESP_LOGE(TAG, "not enough data received");
                     return abort();
                 }
-
-                uint8_t systitleLength = mbusPayload[DLMS_SYST_OFFSET];
-
-                if(systitleLength != 0x08) // Only system titles with length of 8 are supported
+                if(receiveBufferIndex > telegramLength)
                 {
-                    ESP_LOGE(TAG, "DLMS: Unsupported system title length");
+                    ESP_LOGI(TAG," %u", receiveBufferIndex);
+                    ESP_LOGE(TAG, "to much data received");
                     return abort();
                 }
+                    
 
-                uint16_t messageLength = mbusPayload[DLMS_LENGTH_OFFSET];
-                int headerOffset = 0;
 
-                if(messageLength == 0x82)
+
+        /*
+                uint16_t payloadLengthPacket1;
+                memcpy(&payloadLengthPacket1, &receiveBuffer[9], 2); // Copy payload length of first telegram
+
+                payloadLengthPacket1 = swap_uint16(payloadLengthPacket1);
+
+                if(payloadLengthPacket1 >= payloadLength)
                 {
-                    ESP_LOGV(TAG, "DLMS: Message length > 127");
-
-                    memcpy(&messageLength, &mbusPayload[DLMS_LENGTH_OFFSET + 1], 2);
-                    messageLength = swap_uint16(messageLength);
-
-                    headerOffset = DLMS_HEADER_EXT_OFFSET; // Header is now 2 bytes longer due to length > 127
-                }
-                else
-                {
-                    ESP_LOGV(TAG, "DLMS: Message length <= 127");
-                }
-
-                messageLength -= DLMS_LENGTH_CORRECTION; // Correct message length due to part of header being included in length
-
-                if(mbusPayload.size() - DLMS_HEADER_LENGTH - headerOffset != messageLength)
-                {
-                    ESP_LOGE(TAG, "DLMS: Message has invalid length");
+                    ESP_LOGE(TAG, "Payload length 1 is too big");
                     return abort();
                 }
+        */
+                uint16_t payloadLength1 = 235; // TODO: Read payload length 1 from data
 
-                if(mbusPayload[headerOffset + DLMS_SECBYTE_OFFSET] != 0x21) // Only certain security suite is supported (0x21)
-                {
-                    ESP_LOGE(TAG, "DLMS: Unsupported security control byte");
-                    return abort();
-                }
+                uint16_t payloadLength2 = 8;
 
-                // Decryption
+                // if(payloadLength2 >= receiveBufferIndex - DLMS_HEADER2_OFFSET - DLMS_HEADER2_LENGTH)
+                // {
+                //     ESP_LOGE(TAG, "Payload length 2 is too big");
+                //     return abort();
+                // }
 
-                ESP_LOGV(TAG, "Decrypting payload");
+                byte iv[12]; // Reserve space for the IV, always 12 bytes
 
-                uint8_t iv[12]; // Reserve space for the IV, always 12 bytes
-                // Copy system title to IV (System title is before length; no header offset needed!)
-                // Add 1 to the offset in order to skip the system title length byte
-                memcpy(&iv[0], &mbusPayload[DLMS_SYST_OFFSET + 1], systitleLength);
-                memcpy(&iv[8], &mbusPayload[headerOffset + DLMS_FRAMECOUNTER_OFFSET], DLMS_FRAMECOUNTER_LENGTH); // Copy frame counter to IV
+                memcpy(&iv[0], &receiveBuffer[DLMS_SYST_OFFSET], DLMS_SYST_LENGTH); // Copy system title to IV
+                memcpy(&iv[8], &receiveBuffer[DLMS_IC_OFFSET], DLMS_IC_LENGTH); // Copy invocation counter to IV
 
-                uint8_t plaintext[messageLength];
+                byte ciphertext[payloadLength];
+                memcpy(&ciphertext[0], &receiveBuffer[DLMS_HEADER1_OFFSET + DLMS_HEADER1_LENGTH], payloadLength1);
+                memcpy(&ciphertext[payloadLength1], &receiveBuffer[DLMS_HEADER2_OFFSET + DLMS_HEADER2_LENGTH], payloadLength2);
 
-                mbedtls_gcm_init(&this->aes);
-                mbedtls_gcm_setkey(&this->aes, MBEDTLS_CIPHER_ID_AES, this->key, this->keyLength * 8);
+                byte plaintext[payloadLength];
 
-                mbedtls_gcm_auth_decrypt(&this->aes, messageLength, iv, sizeof(iv), NULL, 0, NULL, 0, &mbusPayload[headerOffset + DLMS_PAYLOAD_OFFSET], plaintext);
+                mbedtls_gcm_init(&aes);
+                mbedtls_gcm_setkey(&aes, MBEDTLS_CIPHER_ID_AES , key, keyLength * 8);
 
-                mbedtls_gcm_free(&this->aes);
+                mbedtls_gcm_auth_decrypt(&aes, payloadLength, iv, sizeof(iv), NULL, 0, NULL, 0, ciphertext, plaintext);
+
+                mbedtls_gcm_free(&aes);
 
                 if(plaintext[0] != 0x0F || plaintext[5] != 0x0C)
                 {
-                    ESP_LOGE(TAG, "OBIS: Packet was decrypted but data is invalid");
+                    ESP_LOGE(TAG, "Packet was decrypted but data is invalid");
                     return abort();
                 }
 
+                ESP_LOGI(TAG," %u", plaintext[0]);
+                ESP_LOGI(TAG," %u", plaintext[5]);
+                ESP_LOGI(TAG," %u", plaintext[6]);
+                ESP_LOGI(TAG," %u", plaintext[7]);
+                ESP_LOGI(TAG," %u", plaintext[20]);
+
+               
                 // Decoding
 
-                ESP_LOGV(TAG, "Decoding payload");
-
+                ESP_LOGV(TAG, "Plaintext Packet:");
+                log_packet(plaintext, 300);
                 int currentPosition = DECODER_START_OFFSET;
 
                 do
                 {
+                    ESP_LOGV(TAG, "currentPosition: %d", currentPosition);
+                    ESP_LOGV(TAG, "OBIS header type: %d", plaintext[currentPosition + OBIS_TYPE_OFFSET]);
                     if(plaintext[currentPosition + OBIS_TYPE_OFFSET] != DataType::OctetString)
                     {
-                        ESP_LOGE(TAG, "OBIS: Unsupported OBIS header type");
+                        ESP_LOGE(TAG, "Unsupported OBIS header type");
                         return abort();
                     }
 
-                    uint8_t obisCodeLength = plaintext[currentPosition + OBIS_LENGTH_OFFSET];
+                    byte obisCodeLength = plaintext[currentPosition + OBIS_LENGTH_OFFSET];
+                    ESP_LOGV(TAG, "OBIS code/header length: %d", obisCodeLength);
 
-                    if(obisCodeLength != 0x06)
+                    if(obisCodeLength != 0x06 && obisCodeLength != 0x0C)
                     {
-                        ESP_LOGE(TAG, "OBIS: Unsupported OBIS header length");
+                        ESP_LOGE(TAG, "Unsupported OBIS header length");
                         return abort();
                     }
 
-                    uint8_t obisCode[obisCodeLength];
+                    byte obisCode[obisCodeLength];
                     memcpy(&obisCode[0], &plaintext[currentPosition + OBIS_CODE_OFFSET], obisCodeLength); // Copy OBIS code to array
 
-                    currentPosition += obisCodeLength + 2; // Advance past code, position and type
+                    bool timestampFound = false;
+                    bool meterNumberFound = false;
+                    // Do not advance Position when reading the Timestamp at DECODER_START_OFFSET
+                    if ((obisCodeLength == 0x0C) && (currentPosition  == DECODER_START_OFFSET))
+                    {
+                        timestampFound = true;
+                    } 
+                    else if ((currentPosition  != DECODER_START_OFFSET) && plaintext[currentPosition - 1] == 0xFF)
+                    {
+                        meterNumberFound = true;
+                    }
+                    else
+                    {
+                        currentPosition += obisCodeLength + 2; // Advance past code and position
+                    }
 
-                    uint8_t dataType = plaintext[currentPosition];
+                    byte dataType = plaintext[currentPosition];
                     currentPosition++; // Advance past data type
 
-                    uint8_t dataLength = 0x00;
+                    byte dataLength = 0x00;
 
                     CodeType codeType = CodeType::Unknown;
+
+                    ESP_LOGV(TAG, "obisCode (OBIS_A): %d", obisCode[OBIS_A]);
+                    ESP_LOGV(TAG, "currentPosition: %d", currentPosition);
 
                     if(obisCode[OBIS_A] == Medium::Electricity)
                     {
@@ -232,6 +218,10 @@ namespace esphome
                         {
                             codeType = CodeType::ActivePowerMinus;
                         }
+                        else if(memcmp(&obisCode[OBIS_C], ESPDM_POWER_FACTOR, 2) == 0)
+                        {
+                            codeType = CodeType::PowerFactor;
+                        }
 
                         else if(memcmp(&obisCode[OBIS_C], ESPDM_ACTIVE_ENERGY_PLUS, 2) == 0)
                         {
@@ -252,7 +242,7 @@ namespace esphome
                         }
                         else
                         {
-                            ESP_LOGW(TAG, "OBIS: Unsupported OBIS code");
+                            ESP_LOGW(TAG, "Unsupported OBIS code OBIS_C: %d, OBIS_D: %d", obisCode[OBIS_C], obisCode[OBIS_D]);
                         }
                     }
                     else if(obisCode[OBIS_A] == Medium::Abstract)
@@ -271,12 +261,24 @@ namespace esphome
                         }
                         else
                         {
-                            ESP_LOGW(TAG, "OBIS: Unsupported OBIS code");
+                            ESP_LOGW(TAG, "Unsupported OBIS code OBIS_C: %d, OBIS_D: %d", obisCode[OBIS_C], obisCode[OBIS_D]);
                         }
+                    }
+                    // Needed so the Timestamp at DECODER_START_OFFSET gets read correctly
+                    // as it doesn't have an obisMedium
+                    else if (timestampFound == true)
+                    {
+                        ESP_LOGV(TAG, "Found Timestamp without obisMedium");
+                        codeType = CodeType::Timestamp;
+                    }
+                    else if (meterNumberFound == true)
+                    {
+                        ESP_LOGV(TAG, "Found MeterNumber without obisMedium");
+                        codeType = CodeType::MeterNumber;
                     }
                     else
                     {
-                        ESP_LOGE(TAG, "OBIS: Unsupported OBIS medium");
+                        ESP_LOGE(TAG, "Unsupported OBIS medium");
                         return abort();
                     }
 
@@ -284,6 +286,7 @@ namespace esphome
                     uint16_t uint16Value;
                     uint32_t uint32Value;
                     float floatValue;
+
 
                     switch(dataType)
                     {
@@ -338,8 +341,14 @@ namespace esphome
                             else if(codeType == CodeType::CurrentL3 && this->current_l3 != NULL && this->current_l3->state != floatValue)
                                 this->current_l3->publish_state(floatValue);
 
+                            else if(codeType == CodeType::PowerFactor && this->power_factor != NULL && this->power_factor->state != floatValue)
+                                this->power_factor->publish_state(floatValue / 1000.0);
+
                         break;
                         case DataType::OctetString:
+                            ESP_LOGV(TAG, "Arrived on OctetString");
+                            ESP_LOGV(TAG, "currentPosition: %d, plaintext: %d", currentPosition, plaintext[currentPosition]);
+
                             dataLength = plaintext[currentPosition];
                             currentPosition++; // Advance past string length
 
@@ -369,30 +378,48 @@ namespace esphome
 
                                 this->timestamp->publish_state(timestamp);
                             }
+                            else if(codeType == CodeType::MeterNumber)
+                            {
+                                ESP_LOGV(TAG, "Constructing MeterNumber...");
+                                char meterNumber[13]; // 121110284568
+
+                                memcpy(meterNumber, &plaintext[currentPosition], dataLength);
+                                meterNumber[12] = '\0';
+
+                                this->meternumber->publish_state(meterNumber);
+                            }
 
                         break;
                         default:
-                            ESP_LOGE(TAG, "OBIS: Unsupported OBIS data type");
+                            ESP_LOGE(TAG, "Unsupported OBIS data type");
                             return abort();
                         break;
                     }
 
                     currentPosition += dataLength; // Skip data length
 
-                    currentPosition += 2; // Skip break after data
+                    // Don't skip the break on the first Timestamp, as there's none
+                    if(timestampFound == false)
+                    {
+                        currentPosition += 2; // Skip break after data
+                    }
 
                     if(plaintext[currentPosition] == 0x0F) // There is still additional data for this type, skip it
-                        currentPosition += 6; // Skip additional data and additional break; this will jump out of bounds on last frame
+                    {
+                        //currentPosition += 6; // Skip additional data and additional break; this will jump out of bounds on last frame
+                        // on EVN Meters the additional data (no additional Break) is only 3 Bytes + 1 Byte for the "there is data" Byte
+                        currentPosition += 4; // Skip additional data and additional break; this will jump out of bounds on last frame
+                    }
                 }
-                while (currentPosition <= messageLength); // Loop until arrived at end
+                while (currentPosition <= payloadLength); // Loop until arrived at end
 
-                this->receiveBuffer.clear(); // Reset buffer
+                receiveBufferIndex = 0;
 
                 ESP_LOGI(TAG, "Received valid data");
 
                 if(this->mqtt_client != NULL)
                 {
-                    this->mqtt_client->publish_json(this->topic, [=](JsonObject root)
+                    this->mqtt_client->publish_json(topic, [=](JsonObject root)
                     {
                         if(this->voltage_l1 != NULL)
                         {
@@ -414,6 +441,11 @@ namespace esphome
                             root["active_power_minus"] = this->active_power_minus->state;
                         }
 
+                        if(this->power_factor != NULL)
+                        {
+                            root["power_factor"] = this->power_factor->state;
+                        }
+
                         if(this->active_energy_plus != NULL)
                         {
                             root["active_energy_plus"] = this->active_energy_plus->state;
@@ -430,6 +462,11 @@ namespace esphome
                         {
                             root["timestamp"] = this->timestamp->state;
                         }
+
+                        if(this->meternumber != NULL)
+                        {
+                            root["meternumber"] = this->meternumber->state;
+                        }
                     });
                 }
             }
@@ -437,7 +474,7 @@ namespace esphome
 
         void DlmsMeter::abort()
         {
-            this->receiveBuffer.clear();
+            receiveBufferIndex = 0;
         }
 
         uint16_t DlmsMeter::swap_uint16(uint16_t val)
@@ -451,7 +488,7 @@ namespace esphome
             return (val << 16) | (val >> 16);
         }
 
-        void DlmsMeter::set_key(uint8_t key[], size_t keyLength)
+        void DlmsMeter::set_key(byte key[], size_t keyLength)
         {
             memcpy(&this->key[0], &key[0], keyLength);
             this->keyLength = keyLength;
@@ -470,10 +507,12 @@ namespace esphome
             this->current_l3 = current_l3;
         }
 
-        void DlmsMeter::set_active_power_sensors(sensor::Sensor *active_power_plus, sensor::Sensor *active_power_minus)
+        void DlmsMeter::set_active_power_sensors(sensor::Sensor *active_power_plus, sensor::Sensor *active_power_minus, sensor::Sensor *power_factor)
         {
             this->active_power_plus = active_power_plus;
             this->active_power_minus = active_power_minus;
+            this->power_factor = power_factor;
+
         }
 
         void DlmsMeter::set_active_energy_sensors(sensor::Sensor *active_energy_plus, sensor::Sensor *active_energy_minus)
@@ -493,15 +532,33 @@ namespace esphome
             this->timestamp = timestamp;
         }
 
+        void DlmsMeter::set_meternumber_sensor(text_sensor::TextSensor *meternumber)
+        {
+            this->meternumber = meternumber;
+        }
+
         void DlmsMeter::enable_mqtt(mqtt::MQTTClientComponent *mqtt_client, const char *topic)
         {
             this->mqtt_client = mqtt_client;
             this->topic = topic;
         }
 
-        void DlmsMeter::log_packet(std::vector<uint8_t> data)
+        void DlmsMeter::log_packet(byte array[], size_t length)
         {
-            ESP_LOGV(TAG, format_hex_pretty(data).c_str());
+            char buffer[(length*3)];
+
+            for (unsigned int i = 0; i < length; i++)
+            {
+                byte nib1 = (array[i] >> 4) & 0x0F;
+                byte nib2 = (array[i] >> 0) & 0x0F;
+                buffer[i*3] = nib1  < 0xA ? '0' + nib1  : 'A' + nib1  - 0xA;
+                buffer[i*3+1] = nib2  < 0xA ? '0' + nib2  : 'A' + nib2  - 0xA;
+                buffer[i*3+2] = ' ';
+            }
+
+            buffer[(length*3)-1] = '\0';
+
+            ESP_LOGV(TAG, buffer);
         }
     }
 }
